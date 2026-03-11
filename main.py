@@ -82,13 +82,19 @@ def on_message(client, userdata, msg):
 
 def run_mqtt():
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    
+    if config.MQTT_USER and config.MQTT_PASS:
+        client.username_pw_set(config.MQTT_USER, config.MQTT_PASS)
+        
     client.on_connect = on_connect
     client.on_message = on_message
+    
     while True:
         try:
             client.connect(config.MQTT_BROKER, 1883, 60)
             client.loop_forever()
-        except Exception: 
+        except Exception as e: 
+            print(f"--> [RETRY] MQTT Broker unreachable: {e}")
             time.sleep(5)
 
 # ==========================================
