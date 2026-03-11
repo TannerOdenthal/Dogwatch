@@ -1,0 +1,203 @@
+import time
+import math
+import requests
+import threading
+import json
+import paho.mqtt.client as mqtt
+from datetime import datetime
+from flask import Flask, request, render_template, jsonify
+
+# Import Meshtastic Protobufs natively
+from meshtastic import mesh_pb2, portnums_pb2, mqtt_pb2
+
+# Import our centralized configuration
+import config
+
+# ==========================================
+#              IN-MEMORY STATE
+# ==========================================
+receipt_user1 = None
+receipt_user2 = None    
+consecutive_out_count = 0
+is_lost_mode = False
+travel_mode_until = 0
+
+last_seen_time = "Never"
+last_seen_dist = 0
+last_seen_sats = 0
+last_gps_update = 0
+
+pico_fleet = {} 
+
+# ==========================================
+#              MQTT HANDLERS
+# ==========================================
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print(f"--> [SUCCESS] Connected to MQTT Broker at {config.MQTT_BROKER}")
+        client.subscribe("pico/proximity/#") 
+        client.subscribe("msh/#")            
+    else:
+        print(f"--> [ERROR] MQTT Connection failed with code {rc}")
+
+def on_message(client, userdata, msg):
+    global pico_fleet, last_seen_time, last_seen_dist, last_seen_sats, last_gps_update
+    
+    # STREAM 1: Bluetooth Proximity Data
+    if msg.topic.startswith("pico/proximity/"):
+        try:
+            topic_parts = msg.topic.split('/')
+            if len(topic_parts) >= 4:
+                room_name = topic_parts[2]
+                data = json.loads(msg.payload.decode('utf-8'))
+                
+                if data.get("mac", "").lower() == config.TARGET_MAC.lower():
+                    pico_fleet[room_name] = {
+                        "status": data.get("status", "offline"),
+                        "rssi": data.get("rssi", -100),
+                        "last_ping": time.time()
+                    }
+        except Exception: pass
+
+    # STREAM 2: Meshtastic GPS Data
+    elif msg.topic.startswith("msh/") and config.TARGET_NODE_ID in msg.topic:
+        try:
+            env = mqtt_pb2.ServiceEnvelope()
+            env.ParseFromString(msg.payload)
+            mp = env.packet
+            
+            if mp.HasField("decoded") and mp.decoded.portnum == portnums_pb2.POSITION_APP:
+                pos = mesh_pb2.Position()
+                pos.ParseFromString(mp.decoded.payload)
+                
+                if pos.latitude_i and pos.longitude_i:
+                    p_lat = pos.latitude_i / 10000000.0
+                    p_lon = pos.longitude_i / 10000000.0
+                    
+                    last_seen_dist = int(get_distance(config.HOME_LAT, config.HOME_LON, p_lat, p_lon))
+                    last_seen_sats = getattr(pos, 'sats_in_view', 0)
+                    last_seen_time = datetime.now().strftime('%H:%M:%S')
+                    last_gps_update = time.time()
+        except Exception: pass 
+
+def run_mqtt():
+    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    while True:
+        try:
+            client.connect(config.MQTT_BROKER, 1883, 60)
+            client.loop_forever()
+        except Exception: 
+            time.sleep(5)
+
+# ==========================================
+#              CORE LOGIC & HELPERS
+# ==========================================
+def get_distance(lat1, lon1, lat2, lon2):
+    R = 6371000 
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi, dlambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+def get_fleet_status():
+    is_bt_locked = False
+    best_rssi = -100
+    active_room = "Searching..."
+    current_time = time.time()
+    
+    for room, state in pico_fleet.items():
+        if (current_time - state["last_ping"]) < config.PROX_TIMEOUT:
+            if state["status"] == "online":
+                is_bt_locked = True
+                if state["rssi"] > best_rssi:
+                    best_rssi = state["rssi"]
+                    active_room = room.replace("_", " ").title()
+    return is_bt_locked, best_rssi, active_room
+
+def state_evaluator_loop():
+    global receipt_user1, receipt_user2, consecutive_out_count, is_lost_mode
+    time.sleep(2) 
+
+    while True:
+        current_time = time.time()
+        is_traveling = current_time < travel_mode_until
+        bt_locked, _, active_room = get_fleet_status()
+
+        if last_gps_update > 0:
+            is_safe = (last_seen_dist <= config.SAFE_RADIUS) or bt_locked
+            status_str = "SAFE" if is_safe else "OUTSIDE"
+            bt_str = f"BT-LOCKED [{active_room}]" if bt_locked else "BT-NONE"
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Mem-State: {last_seen_dist}m | Status: {status_str} ({bt_str})")
+
+            if not is_safe and not is_traveling and not is_lost_mode and not receipt_user1:
+                consecutive_out_count += 1
+                if consecutive_out_count >= 2:
+                    print(f"🚨 ALARM! {config.PET_NAME} is out.")
+                    if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
+                        requests.post("https://api.pushover.net/1/messages.json", data={
+                            "token": config.PUSHOVER_API_TOKEN, 
+                            "user": config.USER1_KEY, 
+                            "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away."
+                        })
+                    receipt_user1 = "sent"
+            elif is_safe:
+                consecutive_out_count = 0
+                
+        time.sleep(config.CHECK_INTERVAL)
+
+# ==========================================
+#              WEB SERVER & API
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    # Pass the pet name to the initial HTML render
+    return render_template("index.html", pet_name=config.PET_NAME)
+
+@app.route('/api/status')
+def api_status():
+    global travel_mode_until, last_seen_time, last_seen_dist, last_seen_sats
+    
+    rem = int((travel_mode_until - time.time()) / 60)
+    is_night = 1 <= datetime.now().hour < 7
+    bt_locked, best_rssi, active_room = get_fleet_status()
+    rssi_pct = max(0, min(100, (best_rssi + 100) * 1.6)) if bt_locked else 0
+    
+    return jsonify({
+        "traveling": rem > 0,
+        "remaining_mins": rem,
+        "night_mode": is_night,
+        "last_seen": last_seen_time,
+        "dist": last_seen_dist,
+        "sats": last_seen_sats,
+        "prox_on": bt_locked,
+        "rssi": best_rssi,
+        "rssi_pct": rssi_pct,
+        "room": active_room
+    })
+
+@app.route('/set', methods=['POST'])
+def set_mode():
+    global travel_mode_until
+    minutes = int(request.form.get('minutes', 60))
+    travel_mode_until = time.time() + (minutes * 60)
+    return jsonify({"status": "success", "mode": "travel"})
+
+@app.route('/cancel', methods=['POST'])
+def cancel_mode():
+    global travel_mode_until, receipt_user1, receipt_user2, is_lost_mode
+    travel_mode_until = 0
+    is_lost_mode = False
+    if config.PUSHOVER_API_TOKEN:
+        requests.post(f"https://api.pushover.net/1/receipts/cancel_all.json", data={"token": config.PUSHOVER_API_TOKEN})
+    receipt_user1 = receipt_user2 = None
+    return jsonify({"status": "success", "mode": "armed"})
+
+if __name__ == "__main__":
+    threading.Thread(target=run_mqtt, daemon=True).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5001, use_reloader=False), daemon=True).start()
+    state_evaluator_loop()
