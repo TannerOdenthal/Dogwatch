@@ -18,7 +18,8 @@ import config
 # ==========================================
 receipt_user1 = None
 receipt_user2 = None    
-consecutive_out_count = 0
+gps_out_count = 0
+bt_out_count = 0
 is_lost_mode = False
 travel_mode_until = 0
 
@@ -123,34 +124,48 @@ def get_fleet_status():
     return is_bt_locked, best_rssi, active_room
 
 def state_evaluator_loop():
-    global receipt_user1, receipt_user2, consecutive_out_count, is_lost_mode
+    global receipt_user1, receipt_user2, gps_out_count, bt_out_count, is_lost_mode
     time.sleep(2) 
 
     while True:
         current_time = time.time()
         is_traveling = current_time < travel_mode_until
+        is_night = 1 <= datetime.now().hour < 7
+        
         bt_locked, _, active_room = get_fleet_status()
+        gps_out = last_seen_dist > config.SAFE_RADIUS
+
+        # Update independent failure counters
+        if gps_out:
+            gps_out_count += 1
+        else:
+            gps_out_count = 0
+
+        if not bt_locked:
+            bt_out_count += 1
+        else:
+            bt_out_count = 0
+
+        # Define thresholds: Night mode is more tolerant of Bluetooth flickering
+        gps_threshold = 2
+        bt_threshold = 4 if is_night else 2
 
         if last_gps_update > 0:
-            is_safe = (last_seen_dist <= config.SAFE_RADIUS) or bt_locked
+            is_safe = not (gps_out_count >= gps_threshold and bt_out_count >= bt_threshold)
             status_str = "SAFE" if is_safe else "OUTSIDE"
             bt_str = f"BT-LOCKED [{active_room}]" if bt_locked else "BT-NONE"
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Mem-State: {last_seen_dist}m | Status: {status_str} ({bt_str})")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Mem-State: {last_seen_dist}m | Status: {status_str} ({bt_str}) | GPS-Fail: {gps_out_count}/{gps_threshold} | BT-Fail: {bt_out_count}/{bt_threshold}")
 
             if not is_safe and not is_traveling and not is_lost_mode and not receipt_user1:
-                consecutive_out_count += 1
-                if consecutive_out_count >= 2:
-                    print(f"🚨 ALARM! {config.PET_NAME} is out.")
-                    if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
-                        requests.post("https://api.pushover.net/1/messages.json", data={
-                            "token": config.PUSHOVER_API_TOKEN, 
-                            "user": config.USER1_KEY, 
-                            "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away."
-                        })
-                    receipt_user1 = "sent"
-            elif is_safe:
-                consecutive_out_count = 0
+                print(f"🚨 ALARM! {config.PET_NAME} is out.")
+                if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
+                    requests.post("https://api.pushover.net/1/messages.json", data={
+                        "token": config.PUSHOVER_API_TOKEN, 
+                        "user": config.USER1_KEY, 
+                        "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away."
+                    })
+                receipt_user1 = "sent"
                 
         time.sleep(config.CHECK_INTERVAL)
 

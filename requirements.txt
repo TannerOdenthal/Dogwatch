@@ -1,6 +1,6 @@
 Flask==3.0.2
 paho-mqtt==2.0.0
 requests==2.31.0
-meshtastic==2.2.23
+meshtastic>=2.2.22
 protobuf==4.25.3
 python-dotenv==1.0.1
