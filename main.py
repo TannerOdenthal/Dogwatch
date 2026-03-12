@@ -27,6 +27,11 @@ last_seen_time = "Never"
 last_seen_dist = 0
 last_seen_sats = 0
 last_gps_update = 0
+last_lat = 0.0
+last_lon = 0.0
+last_sent_lat = 0.0
+last_sent_lon = 0.0
+last_breadcrumb_time = 0
 
 pico_fleet = {} 
 
@@ -42,7 +47,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
         print(f"--> [ERROR] MQTT Connection failed with code {rc}")
 
 def on_message(client, userdata, msg):
-    global pico_fleet, last_seen_time, last_seen_dist, last_seen_sats, last_gps_update
+    global pico_fleet, last_seen_time, last_seen_dist, last_seen_sats, last_gps_update, last_lat, last_lon
     
     # STREAM 1: Bluetooth Proximity Data
     if msg.topic.startswith("pico/proximity/"):
@@ -75,6 +80,8 @@ def on_message(client, userdata, msg):
                     p_lat = pos.latitude_i / 10000000.0
                     p_lon = pos.longitude_i / 10000000.0
                     
+                    last_lat = p_lat
+                    last_lon = p_lon
                     last_seen_dist = int(get_distance(config.HOME_LAT, config.HOME_LON, p_lat, p_lon))
                     last_seen_sats = getattr(pos, 'sats_in_view', 0)
                     last_seen_time = datetime.now().strftime('%H:%M:%S')
@@ -124,7 +131,7 @@ def get_fleet_status():
     return is_bt_locked, best_rssi, active_room
 
 def state_evaluator_loop():
-    global receipt_user1, receipt_user2, gps_out_count, bt_out_count, is_lost_mode
+    global receipt_user1, receipt_user2, gps_out_count, bt_out_count, is_lost_mode, last_breadcrumb_time, last_sent_lat, last_sent_lon
     time.sleep(2) 
 
     while True:
@@ -157,15 +164,54 @@ def state_evaluator_loop():
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Mem-State: {last_seen_dist}m | Status: {status_str} ({bt_str}) | GPS-Fail: {gps_out_count}/{gps_threshold} | BT-Fail: {bt_out_count}/{bt_threshold}")
 
+            # 1. PRIMARY ALERT (Escaped)
             if not is_safe and not is_traveling and not is_lost_mode and not receipt_user1:
-                print(f"🚨 ALARM! {config.PET_NAME} is out.")
+                print(f"ALARM! {config.PET_NAME} is out.")
                 if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
                     requests.post("https://api.pushover.net/1/messages.json", data={
                         "token": config.PUSHOVER_API_TOKEN, 
                         "user": config.USER1_KEY, 
-                        "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away."
+                        "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away.",
+                        "url": f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}",
+                        "url_title": "View Map"
                     })
                 receipt_user1 = "sent"
+                is_lost_mode = True # Auto-trigger lost mode for tracking
+
+            # 2. ACTIVE TRACKING (Breadcrumbs for Travel or Lost Mode)
+            if is_traveling or is_lost_mode:
+                if (current_time - last_breadcrumb_time) >= config.BREADCRUMB_DELAY:
+                    # Check if position has changed since last breadcrumb
+                    if last_lat != last_sent_lat or last_lon != last_sent_lon:
+                        label = "TRAVEL" if is_traveling else "LOST"
+                        print(f"Tracking ({label}): {last_seen_dist}m away.")
+                        
+                        if config.PUSHOVER_API_TOKEN:
+                            if last_lat != 0.0:
+                                recipients = []
+                                if config.SEND_BREADCRUMBS_USER1 and config.USER1_KEY:
+                                    recipients.append(config.USER1_KEY)
+                                if config.SEND_BREADCRUMBS_USER2 and config.USER2_KEY:
+                                    recipients.append(config.USER2_KEY)
+                                    
+                                for user_key in recipients:
+                                    requests.post("https://api.pushover.net/1/messages.json", data={
+                                        "token": config.PUSHOVER_API_TOKEN, 
+                                        "user": user_key, 
+                                        "message": f"{label}: {config.PET_NAME} is {last_seen_dist}m away.",
+                                        "priority": -2, # Lowest priority (Silent)
+                                        "url": f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}",
+                                        "url_title": "View Map"
+                                    })
+                                
+                                last_breadcrumb_time = current_time
+                                last_sent_lat = last_lat
+                                last_sent_lon = last_lon
+                            else:
+                                print("Skipping breadcrumb: Waiting for first GPS coordinate.")
+                    else:
+                        # Location hasn't changed, just update time to wait for next window
+                        last_breadcrumb_time = current_time
                 
         time.sleep(config.CHECK_INTERVAL)
 
@@ -210,9 +256,10 @@ def set_mode():
 
 @app.route('/cancel', methods=['POST'])
 def cancel_mode():
-    global travel_mode_until, receipt_user1, receipt_user2, is_lost_mode
+    global travel_mode_until, receipt_user1, receipt_user2, is_lost_mode, last_breadcrumb_time
     travel_mode_until = 0
     is_lost_mode = False
+    last_breadcrumb_time = 0
     if config.PUSHOVER_API_TOKEN:
         requests.post(f"https://api.pushover.net/1/receipts/cancel_all.json", data={"token": config.PUSHOVER_API_TOKEN})
     receipt_user1 = receipt_user2 = None

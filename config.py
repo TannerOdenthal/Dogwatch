@@ -28,3 +28,6 @@ PROX_TIMEOUT = int(os.getenv("PROX_TIMEOUT", 45))
 SAFE_RADIUS = int(os.getenv("SAFE_RADIUS", 75))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 5))
 ESCALATION_DELAY = int(os.getenv("ESCALATION_DELAY", 120))
+BREADCRUMB_DELAY = int(os.getenv("BREADCRUMB_DELAY", 300))
+SEND_BREADCRUMBS_USER1 = os.getenv("SEND_BREADCRUMBS_USER1", "True").lower() == "true"
+SEND_BREADCRUMBS_USER2 = os.getenv("SEND_BREADCRUMBS_USER2", "False").lower() == "true"
