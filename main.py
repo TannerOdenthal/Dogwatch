@@ -22,6 +22,8 @@ gps_out_count = 0
 bt_out_count = 0
 is_lost_mode = False
 travel_mode_until = 0
+alert_start_time = 0
+alert_acknowledged = False
 
 last_seen_time = "Never"
 last_seen_dist = 0
@@ -34,6 +36,56 @@ last_sent_lon = 0.0
 last_breadcrumb_time = 0
 
 pico_fleet = {} 
+
+# ==========================================
+#           PUSHOVER ALERT HELPERS
+# ==========================================
+def send_pushover_alert(msg, user_key, priority="2", map_url=None):
+    if not user_key or not config.PUSHOVER_API_TOKEN: 
+        return None
+        
+    payload = {
+        "token": config.PUSHOVER_API_TOKEN,
+        "user": user_key,
+        "message": msg,
+        "title": "RENO ESCAPED!" if priority == "2" else "Reno Location Update",
+        "priority": priority,
+        "sound": "siren" if priority == "2" else "pushover"
+    }
+    
+    if priority == "2":
+        payload["retry"] = "30"
+        payload["expire"] = "3600"
+        
+    if map_url:
+        payload["url"] = map_url
+        payload["url_title"] = "Open in Google Maps"
+
+    try:
+        r = requests.post("https://api.pushover.net/1/messages.json", data=payload)
+        if r.status_code == 200:
+            return r.json().get("receipt")
+    except Exception as e:
+        print(f"--> [ERROR] Failed to send Pushover alert: {e}")
+    return None
+
+def check_receipt_status(receipt):
+    if not receipt or not config.PUSHOVER_API_TOKEN: 
+        return False
+    try:
+        r = requests.get(f"https://api.pushover.net/1/receipts/{receipt}.json", params={"token": config.PUSHOVER_API_TOKEN})
+        return r.json().get("acknowledged") == 1
+    except Exception as e:
+        print(f"--> [ERROR] Failed to check receipt status: {e}")
+        return False
+
+def cancel_pushover_alert(receipt):
+    if not receipt or not config.PUSHOVER_API_TOKEN: 
+        return
+    try:
+        requests.post(f"https://api.pushover.net/1/receipts/{receipt}/cancel.json", data={"token": config.PUSHOVER_API_TOKEN})
+    except Exception as e:
+        print(f"--> [ERROR] Failed to cancel Pushover alert: {e}")
 
 # ==========================================
 #              MQTT HANDLERS
@@ -131,7 +183,7 @@ def get_fleet_status():
     return is_bt_locked, best_rssi, active_room
 
 def state_evaluator_loop():
-    global receipt_user1, receipt_user2, gps_out_count, bt_out_count, is_lost_mode, last_breadcrumb_time, last_sent_lat, last_sent_lon
+    global receipt_user1, receipt_user2, gps_out_count, bt_out_count, is_lost_mode, last_breadcrumb_time, last_sent_lat, last_sent_lon, alert_start_time, alert_acknowledged
     time.sleep(2) 
 
     while True:
@@ -165,36 +217,60 @@ def state_evaluator_loop():
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Mem-State: {last_seen_dist}m | Status: {status_str} ({bt_str}) | GPS-Fail: {gps_out_count}/{gps_threshold} | BT-Fail: {bt_out_count}/{bt_threshold}")
 
             # 1. PRIMARY ALERT (Escaped)
-            if not is_safe and not is_traveling and not is_lost_mode and not receipt_user1:
+            if not is_safe and not is_traveling and not is_lost_mode:
                 print(f"ALARM! {config.PET_NAME} is out.")
-                if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
-                    requests.post("https://api.pushover.net/1/messages.json", data={
-                        "token": config.PUSHOVER_API_TOKEN, 
-                        "user": config.USER1_KEY, 
-                        "message": f"{config.PET_NAME} escaped! {last_seen_dist}m away.",
-                        "url": f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}",
-                        "url_title": "View Map"
-                    })
-                receipt_user1 = "sent"
-                is_lost_mode = True # Auto-trigger lost mode for tracking
+                is_lost_mode = True 
+                alert_acknowledged = False
+                alert_start_time = current_time
+                receipt_user1 = send_pushover_alert(
+                    f"{config.PET_NAME} escaped! {last_seen_dist}m away.", 
+                    config.USER1_KEY, 
+                    priority="2", 
+                    map_url=f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}"
+                )
 
-            # 2. SAFE RETURN (Automatic Reset)
+            # 2. MONITOR ACKNOWLEDGMENT & ESCALATION
+            if is_lost_mode and not alert_acknowledged:
+                # Check for acknowledgment from User 1 or User 2
+                if check_receipt_status(receipt_user1) or check_receipt_status(receipt_user2):
+                    print(f"ACK! Alert acknowledged for {config.PET_NAME}.")
+                    alert_acknowledged = True
+                    cancel_pushover_alert(receipt_user1)
+                    cancel_pushover_alert(receipt_user2)
+                    last_breadcrumb_time = 0 # Trigger immediate breadcrumb update after ack
+                
+                # Escalation to User 2 if not acknowledged within delay
+                elif (current_time - alert_start_time) > config.ESCALATION_DELAY:
+                    if not receipt_user2 and config.USER2_KEY:
+                        print(f"ESCALATION! Notifying {config.USER2_KEY} for {config.PET_NAME}.")
+                        receipt_user2 = send_pushover_alert(
+                            f"ESCALATION: {config.PET_NAME} is still missing! {last_seen_dist}m away.", 
+                            config.USER2_KEY, 
+                            priority="2", 
+                            map_url=f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}"
+                        )
+
+            # 3. SAFE RETURN (Automatic Reset)
             if is_safe and is_lost_mode:
                 print(f"SAFE! {config.PET_NAME} is back home.")
+                cancel_pushover_alert(receipt_user1)
+                cancel_pushover_alert(receipt_user2)
+                
                 if config.PUSHOVER_API_TOKEN and config.USER1_KEY:
-                    requests.post("https://api.pushover.net/1/messages.json", data={
-                        "token": config.PUSHOVER_API_TOKEN, 
-                        "user": config.USER1_KEY, 
-                        "message": f"SAFE! {config.PET_NAME} is back home and secure.",
-                        "priority": 0 # Standard Priority
-                    })
+                    send_pushover_alert(
+                        f"SAFE! {config.PET_NAME} is back home and secure.", 
+                        config.USER1_KEY, 
+                        priority="0"
+                    )
+                
                 is_lost_mode = False
+                alert_acknowledged = False
                 receipt_user1 = None
                 receipt_user2 = None
                 last_breadcrumb_time = 0
 
-            # 3. ACTIVE TRACKING (Breadcrumbs for Travel or Lost Mode)
-            if is_traveling or is_lost_mode:
+            # 4. ACTIVE TRACKING (Breadcrumbs for Travel or Lost Mode)
+            if is_traveling or (is_lost_mode and alert_acknowledged):
                 if (current_time - last_breadcrumb_time) >= config.BREADCRUMB_DELAY:
                     # Check if position has changed since last breadcrumb
                     if last_lat != last_sent_lat or last_lon != last_sent_lon:
@@ -210,14 +286,12 @@ def state_evaluator_loop():
                                     recipients.append(config.USER2_KEY)
                                     
                                 for user_key in recipients:
-                                    requests.post("https://api.pushover.net/1/messages.json", data={
-                                        "token": config.PUSHOVER_API_TOKEN, 
-                                        "user": user_key, 
-                                        "message": f"{label}: {config.PET_NAME} is {last_seen_dist}m away.",
-                                        "priority": -2, # Lowest priority (Silent)
-                                        "url": f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}",
-                                        "url_title": "View Map"
-                                    })
+                                    send_pushover_alert(
+                                        f"{label}: {config.PET_NAME} is {last_seen_dist}m away.",
+                                        user_key,
+                                        priority="-1", # Quiet Priority
+                                        map_url=f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}"
+                                    )
                                 
                                 last_breadcrumb_time = current_time
                                 last_sent_lat = last_lat
@@ -271,12 +345,18 @@ def set_mode():
 
 @app.route('/cancel', methods=['POST'])
 def cancel_mode():
-    global travel_mode_until, receipt_user1, receipt_user2, is_lost_mode, last_breadcrumb_time
+    global travel_mode_until, receipt_user1, receipt_user2, is_lost_mode, last_breadcrumb_time, alert_acknowledged, alert_start_time
     travel_mode_until = 0
     is_lost_mode = False
+    alert_acknowledged = False
+    alert_start_time = 0
     last_breadcrumb_time = 0
+    
     if config.PUSHOVER_API_TOKEN:
+        cancel_pushover_alert(receipt_user1)
+        cancel_pushover_alert(receipt_user2)
         requests.post(f"https://api.pushover.net/1/receipts/cancel_all.json", data={"token": config.PUSHOVER_API_TOKEN})
+        
     receipt_user1 = receipt_user2 = None
     return jsonify({"status": "success", "mode": "armed"})
 
