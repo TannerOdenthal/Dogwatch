@@ -231,6 +231,9 @@ def state_evaluator_loop():
 
             # 2. MONITOR ACKNOWLEDGMENT & ESCALATION
             if is_lost_mode and not alert_acknowledged:
+                time_since_alert = int(current_time - alert_start_time)
+                print(f"Monitoring ACK: {time_since_alert}s since alert. User2 Receipt: {receipt_user2}")
+                
                 # Check for acknowledgment from User 1 or User 2
                 if check_receipt_status(receipt_user1) or check_receipt_status(receipt_user2):
                     print(f"ACK! Alert acknowledged for {config.PET_NAME}.")
@@ -241,14 +244,17 @@ def state_evaluator_loop():
                 
                 # Escalation to User 2 if not acknowledged within delay
                 elif (current_time - alert_start_time) > config.ESCALATION_DELAY:
-                    if not receipt_user2 and config.USER2_KEY:
-                        print(f"ESCALATION! Notifying {config.USER2_KEY} for {config.PET_NAME}.")
-                        receipt_user2 = send_pushover_alert(
-                            f"ESCALATION: {config.PET_NAME} is still missing! {last_seen_dist}m away.", 
-                            config.USER2_KEY, 
-                            priority="2", 
-                            map_url=f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}"
-                        )
+                    if not receipt_user2:
+                        # Set a placeholder to prevent re-triggering if send fails or key is missing
+                        receipt_user2 = "attempted" 
+                        if config.USER2_KEY:
+                            print(f"ESCALATION! Notifying {config.USER2_KEY} for {config.PET_NAME}.")
+                            receipt_user2 = send_pushover_alert(
+                                f"ESCALATION: {config.PET_NAME} is still missing! {last_seen_dist}m away.", 
+                                config.USER2_KEY, 
+                                priority="2", 
+                                map_url=f"https://www.google.com/maps/search/?api=1&query={last_lat},{last_lon}"
+                            )
 
             # 3. SAFE RETURN (Automatic Reset)
             if is_safe and is_lost_mode:
